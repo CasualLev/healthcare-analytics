@@ -1,5 +1,5 @@
 -- Generates a realistic volume of data on top of the sample data.
--- Run after 01_oltp_schema.sql and 02_oltp_sample_data.sql.
+-- Run after oltp_schema.sql and oltp_sample_data.sql.
 -- Deterministic: CRC32 of a fixed string replaces RAND(), so every run
 -- produces exactly the same rows. To start over, rerun 01 and 02 first.
 
