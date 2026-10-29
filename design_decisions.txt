@@ -66,7 +66,7 @@ dim_date (one row per calendar day, 2020-01-01 to 2030-12-31)
 - calendar_date     DATE
 - year, quarter, month, day_of_month
 - month_name        'May'
-- year_month        '2024-05'  - pre-formatted, replaces DATE_FORMAT() in Q1/Q4
+- year_month_label  '2024-05'  - pre-formatted, replaces DATE_FORMAT() in Q1/Q4
 - day_of_week, day_name, is_weekend
 - week_of_year
 Used in three roles from the fact table: encounter date, discharge date,
@@ -76,7 +76,7 @@ dim_patient (one row per patient)
 - patient_key, patient_id, mrn
 - first_name, last_name
 - date_of_birth, gender
-- age_group ('0-17', '18-34', '35-49', '50-64', '65-79', '80+'), current age
+- age_group ('0-17', '18-34', '35-49', '50-64', '65-79', '80+')
 Note: age changes over time. The age group here is the patient's CURRENT
 group (refreshed by the ETL). Age at the time of care is stored on the fact
 row (age_at_encounter), so historical analysis is not distorted.
@@ -231,7 +231,7 @@ SUMMARY: HOW EACH BOTTLENECK IS ADDRESSED
 
 Bottleneck (Part 2)                          Design response
 -------------------------------------------  ------------------------------------------------
-Q1: specialty 2 hops away, DATE_FORMAT/row   specialty_key on fact; year_month in dim_date
+Q1: specialty 2 hops away, DATE_FORMAT/row   specialty_key on fact; year_month_label in dim_date
 Q2: junction x junction explosion, text sort integer-only bridges, group on keys, label after
 Q3: self-join recomputed every run           readmitted_within_30_days computed once in ETL
 Q4: billing -> encounters -> ... 4-table     allowed/claim totals stored on the fact row
