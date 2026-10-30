@@ -1,0 +1,201 @@
+HEALTHCARE ANALYTICS LAB - PART 2: QUERY ANALYSIS (NORMALIZED OLTP SCHEMA)
+===========================================================================
+
+Test environment
+- MySQL 8.4, database healthcare_oltp
+- Data: sample data + setup/generated_data.sql (50,003 patients, 200,004
+  encounters, 500,005 diagnoses rows, 300,001 procedure rows, 189,902 claims)
+
+How performance was measured
+- Execution time: 6 runs, first (cold) run discarded, median of the other 5.
+- Rows scanned: FLUSH STATUS; <query>; SHOW SESSION STATUS LIKE 'Handler_read%'
+  (Handler_read_key + Handler_read_next + Handler_read_rnd_next).
+- Query plans: EXPLAIN ANALYZE <query>.
+
+
+---------------------------------------------------------------------------
+QUESTION 1: Monthly Encounters by Specialty
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    DATE_FORMAT(e.encounter_date, '%Y-%m') AS encounter_month,
+    s.specialty_name,
+    e.encounter_type,
+    COUNT(*)                     AS total_encounters,
+    COUNT(DISTINCT e.patient_id) AS unique_patients
+FROM encounters e
+JOIN providers   p ON p.provider_id  = e.provider_id
+JOIN specialties s ON s.specialty_id = p.specialty_id
+GROUP BY encounter_month, s.specialty_name, e.encounter_type
+ORDER BY encounter_month, s.specialty_name, e.encounter_type;
+
+Schema Analysis:
+- Tables joined: encounters, providers, specialties
+- Number of joins: 2
+- Specialty is not on the encounter: it is two hops away
+  (encounters -> providers -> specialties).
+
+Performance:
+- Execution time: 0.736 seconds
+- Estimated rows scanned: ~200,400
+- Result: 456 rows
+
+Bottleneck Identified:
+- Full pass over all 200,004 encounters, each joined to provider and
+  specialty just to learn its specialty.
+- Month is computed per row with DATE_FORMAT(), so the encounter_date
+  index cannot help with grouping.
+- GROUP BY + COUNT(DISTINCT) sorts all 200K joined rows on text columns
+  (~35% of the time).
+Root cause: the grouping attributes (month, specialty) are not stored on
+the row being counted, so they are rebuilt on every run.
+
+
+---------------------------------------------------------------------------
+QUESTION 2: Top Diagnosis-Procedure Pairs
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    d.icd10_code,
+    d.icd10_description,
+    pr.cpt_code,
+    pr.cpt_description,
+    COUNT(DISTINCT ed.encounter_id) AS encounter_count
+FROM encounter_diagnoses ed
+JOIN encounter_procedures ep ON ep.encounter_id = ed.encounter_id
+JOIN diagnoses  d  ON d.diagnosis_id  = ed.diagnosis_id
+JOIN procedures pr ON pr.procedure_id = ep.procedure_id
+GROUP BY d.icd10_code, d.icd10_description, pr.cpt_code, pr.cpt_description
+ORDER BY encounter_count DESC
+LIMIT 10;
+
+Schema Analysis:
+- Tables joined: encounter_diagnoses, encounter_procedures, diagnoses, procedures
+- Number of joins: 3
+- How the junction tables are combined: they share only encounter_id, so
+  joining on it pairs every diagnosis with every procedure of the same
+  encounter (3 diagnoses x 2 procedures = 6 rows).
+- COUNT(DISTINCT encounter_id) counts each pair once per encounter.
+
+Performance:
+- Execution time: 5.971 seconds
+- Estimated rows scanned: ~2,392,000
+- Intermediate rows produced: 899,998
+- Result: 1,102 distinct pairs (top 10 shown)
+
+Bottleneck Identified:
+- Row explosion: 500K diagnosis rows x 300K procedure rows -> 900K pairs
+  (4.5 per encounter).
+- Each of the 900K rows needs an extra lookup for its ICD-10 code, then a
+  sort on four text columns and a COUNT(DISTINCT).
+- Join ~4.4 s, sort + grouping ~2.1 s: the slowest query by 4x.
+Root cause: cost grows with (diagnoses x procedures) per encounter, not
+with the number of encounters.
+
+
+---------------------------------------------------------------------------
+QUESTION 3: 30-Day Readmission Rate
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    s.specialty_name,
+    COUNT(DISTINCT i.encounter_id) AS inpatient_discharges,
+    COUNT(DISTINCT CASE WHEN r.encounter_id IS NOT NULL THEN i.encounter_id END) AS readmissions,
+    ROUND(100 * COUNT(DISTINCT CASE WHEN r.encounter_id IS NOT NULL THEN i.encounter_id END)
+              / COUNT(DISTINCT i.encounter_id), 2) AS readmission_rate_pct
+FROM encounters i
+JOIN providers   p ON p.provider_id  = i.provider_id
+JOIN specialties s ON s.specialty_id = p.specialty_id
+LEFT JOIN encounters r
+       ON r.patient_id     = i.patient_id
+      AND r.encounter_date >  i.discharge_date
+      AND r.encounter_date <= i.discharge_date + INTERVAL 30 DAY
+WHERE i.encounter_type = 'Inpatient'
+GROUP BY s.specialty_name
+ORDER BY readmission_rate_pct DESC;
+
+Schema Analysis:
+- Tables joined: encounters (i = inpatient stay), providers, specialties,
+  encounters again (r = return visit)
+- Number of joins: 3 (including 1 self-join)
+- How a readmission is detected: for each inpatient stay i, look for an
+  encounter r of the same patient with
+  i.discharge_date < r.encounter_date <= i.discharge_date + 30 days.
+- LEFT JOIN keeps stays with no return, so they count in the denominator.
+- Definition: a return of any encounter type (as the brief states),
+  attributed to the specialty of the original stay.
+- COUNT(DISTINCT) is needed: a stay with two returns matches two r rows
+  but is one readmission.
+
+Performance:
+- Execution time: 0.706 seconds
+- Estimated rows scanned: ~482,700
+- Result: 9 specialties; highest is Oncology at 15.48% (454 of 2,933)
+
+Bottleneck Identified:
+- Full table scan: encounter_type is not indexed, so all 200K encounters
+  are read to find 35,931 inpatient stays.
+- The self-join probes encounters 35,931 times. The index is on
+  patient_id only, so each probe reads the patient's WHOLE history
+  (179K rows in total) and filters the date window row by row.
+- COUNT(DISTINCT) over the LEFT JOIN creates 8 internal temp tables.
+Root cause: readmission is not stored, so it is recomputed with a
+self-join on every run.
+
+
+---------------------------------------------------------------------------
+QUESTION 4: Revenue by Specialty & Month
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    DATE_FORMAT(e.encounter_date, '%Y-%m') AS service_month,
+    s.specialty_name,
+    SUM(b.allowed_amount) AS total_allowed,
+    SUM(b.claim_amount)   AS total_claimed,
+    COUNT(*)              AS claims
+FROM billing b
+JOIN encounters  e ON e.encounter_id = b.encounter_id
+JOIN providers   p ON p.provider_id  = e.provider_id
+JOIN specialties s ON s.specialty_id = p.specialty_id
+GROUP BY service_month, s.specialty_name
+ORDER BY service_month, total_allowed DESC;
+
+Schema Analysis:
+- Tables joined: billing, encounters, providers, specialties
+- Number of joins: 3
+- JOIN chain: billing -> encounters -> providers -> specialties.
+  The amount and the specialty sit at opposite ends of the chain.
+- Month = service month (encounter_date), so revenue lands in the month
+  care was delivered. This is why the claim_date index cannot be used.
+
+Performance:
+- Execution time: 1.544 seconds
+- Estimated rows scanned: ~780,700
+- Result: 240 rows (24 months x 10 specialties)
+
+Bottleneck Identified:
+- The 3-hop chain runs per row: 200K encounters, then 200K separate index
+  lookups into billing (~1.34 s of the 1.66 s in EXPLAIN ANALYZE).
+- 189,902 joined rows are aggregated through a temp table on a computed
+  month string.
+Root cause: the measure (allowed_amount) is stored away from every
+attribute used to group it, so the connection is rebuilt on every run.
+
+
+---------------------------------------------------------------------------
+SUMMARY
+---------------------------------------------------------------------------
+
+Query  Joins  Rows scanned  Time      Main bottleneck
+Q1     2      ~200K         0.736 s   JOIN chain + sort of all rows for GROUP BY
+Q2     3      ~2.39M        5.971 s   Junction x junction row explosion (900K rows)
+Q3     3      ~483K         0.706 s   Self-join probing every patient's history
+Q4     3      ~781K         1.544 s   4-table chain + temp-table aggregation
+
+Common pattern: 3NF stores each fact once, where it is easiest to keep
+correct. Analytics needs those facts together, so every query pays to
+re-assemble them, and that cost grows with every new row of history.

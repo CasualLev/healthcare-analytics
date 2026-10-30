@@ -1,0 +1,173 @@
+HEALTHCARE ANALYTICS LAB - PART 3.4: ETL DESIGN
+===============================================
+
+Source: healthcare_oltp (3NF)  ->  Target: healthcare_dw (star schema)
+Runnable implementation: setup/etl_load.sql (full refresh, used for testing)
+
+Load order (parents before children, so every key lookup finds its row):
+  1. dim_date  ->  2. other dimensions  ->  3. fact_encounters  ->  4. bridges
+
+Every dimension gets a key 0 "Unknown" row first. Facts with a missing
+reference point to it, so inner joins never silently drop rows.
+
+
+---------------------------------------------------------------------------
+1. DIMENSION LOAD LOGIC
+---------------------------------------------------------------------------
+
+dim_date (one-time load)
+- Generated, not extracted: a recursive CTE produces every day from
+  2020-01-01 to 2030-12-31 (4,018 rows).
+- Calendar attributes (year, quarter, year_month_label, day_name,
+  is_weekend...) are computed once here, so queries never call date
+  functions per row.
+- Extended by a yearly job before 2031; no other maintenance needed.
+
+dim_patient (from patients)
+  FOR EACH patient in source:
+      age_group = bucket(TIMESTAMPDIFF(YEAR, date_of_birth, today))
+                  -> '0-17' | '18-34' | '35-49' | '50-64' | '65-79' | '80+'
+                  ('Unknown' if date_of_birth is NULL)
+      INSERT (patient_id, mrn, names, date_of_birth, gender, age_group)
+- patient_key is a new surrogate key (AUTO_INCREMENT); patient_id is kept
+  as the natural key for lookups.
+
+Other dimensions
+- dim_provider: providers LEFT JOIN specialties, departments; names copied
+  in (denormalized). full_name = 'Dr. ' + name for MD/DO.
+- dim_diagnosis: icd10_category = first 3 characters; icd10_chapter mapped
+  from the code letter (I -> Circulatory system, J -> Respiratory...).
+- dim_procedure: cpt_category from the code range (992xx E&M, 7xxxx
+  Radiology, 8xxxx Pathology & Lab, other 9xxxx Medicine, 1-6xxxx Surgery).
+- dim_specialty, dim_department: straight copy.
+- dim_encounter_type: DISTINCT types from encounters, plus is_inpatient
+  and care_setting flags.
+
+Handling updates: SCD Type 1 (overwrite)
+  INSERT ... ON DUPLICATE KEY UPDATE   -- matched on the natural key
+- New members are inserted; changed attributes overwrite the old values.
+- Why Type 1: corrections (name typo, new department) should apply to all
+  history, and no query here needs "as it was then" dimension values.
+- History that matters is kept on the fact row instead: specialty_key
+  (specialty at time of visit) and age_at_encounter.
+- age_group is recalculated on every run, since it drifts as patients age.
+
+
+---------------------------------------------------------------------------
+2. FACT TABLE LOAD LOGIC (fact_encounters)
+---------------------------------------------------------------------------
+
+Dimension key lookup (surrogate key pipeline)
+  FOR EACH encounter e:
+      encounter_date_key  = dim_date.date_key  WHERE calendar_date = DATE(e.encounter_date)
+      discharge_date_key  = dim_date.date_key  WHERE calendar_date = DATE(e.discharge_date)
+      patient_key         = dim_patient        WHERE patient_id    = e.patient_id
+      provider_key        = dim_provider       WHERE provider_id   = e.provider_id
+      specialty_key       = dim_specialty      WHERE specialty_id  = provider's specialty
+      department_key      = dim_department     WHERE department_id = e.department_id
+      encounter_type_key  = dim_encounter_type WHERE name          = e.encounter_type
+      primary_diagnosis_key = dim_diagnosis    WHERE diagnosis_id  = diagnosis with sequence 1
+- Implemented set-based: one INSERT ... SELECT with LEFT JOINs, not a row
+  loop. LEFT JOIN + COALESCE(key, 0) handles misses (see below).
+
+Pre-aggregated metrics
+- Each child table is aggregated to one row per encounter BEFORE joining,
+  so joins stay 1:1 and nothing is multiplied:
+    diagnosis_count      = COUNT(*) from encounter_diagnoses
+    procedure_count      = COUNT(*) from encounter_procedures
+    claim_count          = COUNT(*) from billing
+    total_claim_amount   = SUM(claim_amount)
+    total_allowed_amount = SUM(allowed_amount)
+- Row-level derivations:
+    length_of_stay_hours = TIMESTAMPDIFF(MINUTE, encounter, discharge) / 60
+    length_of_stay_days  = DATEDIFF(discharge, encounter)
+    age_at_encounter     = TIMESTAMPDIFF(YEAR, date_of_birth, encounter_date)
+- readmitted_within_30_days = 1 if the encounter is Inpatient AND
+  EXISTS another encounter of the same patient with
+  discharge_date < encounter_date <= discharge_date + 30 days.
+  Same rule as OLTP Q3, computed once here instead of on every report.
+
+Missing data
+- Missing dimension reference (NULL or unknown ID) -> key 0 "Unknown".
+  The row is kept, and is easy to count and fix later.
+- No bill yet -> claim_count = 0, amounts = 0.00 (never NULL, so SUMs work).
+- No diagnoses / procedures -> counts = 0, primary_diagnosis_key = 0.
+- Missing discharge_date or date_of_birth -> length of stay / age stay
+  NULL (unknown is not the same as zero).
+
+Data quality checks after load (reconciliation)
+- Fact row count = source encounter count.
+- SUM(claim_count) = billing row count; SUM(total_allowed_amount) = source sum.
+- Bridge row counts = junction table row counts.
+- Number of fact rows pointing to an Unknown member (expected 0 here).
+
+Tested result (MySQL 8.4, full load in ~41 s): all checks OK.
+- 200,004 fact rows; 500,005 / 300,001 bridge rows; 189,902 claims.
+- SUM(allowed_amount) = 595,738,539.75 in both source and warehouse.
+- Readmission rates per specialty identical to OLTP Q3
+  (e.g. Oncology 454 / 2,933 = 15.48%).
+
+
+---------------------------------------------------------------------------
+3. BRIDGE TABLE LOAD LOGIC
+---------------------------------------------------------------------------
+
+bridge_encounter_diagnoses (from encounter_diagnoses)
+  FOR EACH encounter_diagnoses row:
+      encounter_key      = fact_encounters.encounter_key WHERE encounter_id matches
+      diagnosis_key      = dim_diagnosis WHERE diagnosis_id matches (else 0)
+      diagnosis_sequence = source sequence
+      is_primary         = (diagnosis_sequence = 1)
+
+bridge_encounter_procedures (from encounter_procedures)
+  FOR EACH encounter_procedures row:
+      encounter_key      = fact_encounters.encounter_key WHERE encounter_id matches
+      procedure_key      = dim_procedure WHERE procedure_id matches (else 0)
+      procedure_date_key = dim_date WHERE calendar_date = procedure_date (else 0)
+
+- Loaded AFTER the fact table, because they need its encounter_key.
+- GROUP BY (encounter_key, code_key) de-duplicates the source, so the bridge
+  primary key holds and Q2 can use COUNT(*) instead of COUNT(DISTINCT).
+- Only integer keys are stored; ICD/CPT labels stay in the dimensions.
+
+
+---------------------------------------------------------------------------
+4. REFRESH STRATEGY
+---------------------------------------------------------------------------
+
+Frequency: daily incremental load, overnight (off-peak for the OLTP system).
+- Analytics here (monthly volumes, revenue, readmissions) do not need
+  real-time data; day-old data is fine.
+- Full refresh (what setup/etl_load.sql does) is kept for the initial load
+  and for disaster recovery, not for daily use.
+
+Incremental load (change data capture by watermark)
+  last_run = watermark stored in an etl_control table
+  1. Extract source rows created/changed since last_run
+     (needs an updated_at column or CDC/binlog on the source tables).
+  2. Upsert dimensions (Type 1, ON DUPLICATE KEY UPDATE).
+  3. Upsert facts keyed on encounter_id (the degenerate key):
+     new encounter -> INSERT; changed encounter -> UPDATE the row.
+  4. For changed encounters: delete + re-insert their bridge rows.
+  5. Run reconciliation checks, then advance the watermark.
+- Each step is idempotent: rerunning a failed night does not duplicate rows.
+
+Late-arriving facts
+- Late claim (billing arrives days after the encounter): recompute
+  claim_count and amounts for that encounter and UPDATE the existing fact
+  row. Revenue moves to the correct service month automatically.
+- Late encounter can change an OLDER fact: a new visit may turn a previous
+  inpatient stay into a readmission. So for every new encounter, recompute
+  readmitted_within_30_days for the same patient's inpatient stays
+  discharged in the 30 days before it.
+- Late diagnoses/procedures (coding is often finished after discharge):
+  rebuild that encounter's bridge rows and update its counts and
+  primary_diagnosis_key.
+
+Late-arriving dimension members (early-arriving facts)
+- If an encounter references a patient/provider not yet in the dimension,
+  the fact is loaded with key 0 instead of being rejected.
+- On a later run, once the member exists, fact rows still at key 0 are
+  re-looked-up by natural ID and fixed.
+- Alternative for production: insert an "inferred member" (natural ID only,
+  attributes 'Pending') so the fact gets its real key immediately.

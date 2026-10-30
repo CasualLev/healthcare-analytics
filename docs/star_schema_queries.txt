@@ -1,0 +1,191 @@
+HEALTHCARE ANALYTICS LAB - PART 3.3: QUERIES ON THE STAR SCHEMA
+================================================================
+
+Test environment
+- MySQL 8.4, database healthcare_dw, loaded by setup/etl_load.sql
+  (200,004 fact rows, 500,005 + 300,001 bridge rows).
+- Same machine, same day and same method as query_analysis.txt:
+  6 runs, first (cold) run discarded, median of the other 5.
+- Rows read = Handler_read_key + Handler_read_next + Handler_read_rnd_next.
+- Every query returns exactly the same result as its OLTP version
+  (output compared byte for byte).
+
+Two query patterns used throughout
+- Aggregate on integer keys first, join labels last: dimensions are joined
+  to the small aggregated result (10-456 rows), not to 200K fact rows.
+- Covering indexes: the fact index holds every column a query needs, so
+  MySQL reads the index only and never fetches the full table row.
+
+
+---------------------------------------------------------------------------
+QUESTION 1: Monthly Encounters by Specialty
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    m.encounter_month,
+    s.specialty_name,
+    t.encounter_type_name AS encounter_type,
+    m.total_encounters,
+    m.unique_patients
+FROM (
+    SELECT d.year_month_label           AS encounter_month,
+           f.specialty_key,
+           f.encounter_type_key,
+           COUNT(*)                     AS total_encounters,
+           COUNT(DISTINCT f.patient_key) AS unique_patients
+    FROM dim_date d
+    JOIN fact_encounters f ON f.encounter_date_key = d.date_key
+    GROUP BY d.year_month_label, f.specialty_key, f.encounter_type_key
+) m
+JOIN dim_specialty      s ON s.specialty_key      = m.specialty_key
+JOIN dim_encounter_type t ON t.encounter_type_key = m.encounter_type_key
+ORDER BY m.encounter_month, s.specialty_name, encounter_type;
+
+Performance:
+- Execution time: 0.276 s vs. 0.736 s original
+- Improvement: 2.7x faster
+- Rows read: ~209K vs. ~200K (about the same)
+- Joins: 3 vs. 2, but two of them touch only the 456 result rows
+
+Why it is faster:
+- Covering index (encounter_date_key, specialty_key, encounter_type_key,
+  patient_key, ...): all 200K rows come from the index, no table reads.
+- Month is a stored label (year_month_label), not DATE_FORMAT() per row.
+- Groups and sorts on a 7-char label + two integers instead of two text
+  columns; specialty is one hop away (specialty_key on the fact).
+- Lesson learned: the straightforward version (join all three dimensions,
+  then GROUP BY names) took 1.05 s, SLOWER than OLTP. MySQL chose the
+  wrong index and did 400K dimension lookups. A star schema enables speed;
+  the query shape still has to use it.
+
+
+---------------------------------------------------------------------------
+QUESTION 2: Top Diagnosis-Procedure Pairs
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    dx.icd10_code,
+    dx.icd10_description,
+    px.cpt_code,
+    px.cpt_description,
+    pairs.encounter_count
+FROM (
+    SELECT bd.diagnosis_key, bp.procedure_key, COUNT(*) AS encounter_count
+    FROM bridge_encounter_diagnoses  bd
+    JOIN bridge_encounter_procedures bp ON bp.encounter_key = bd.encounter_key
+    GROUP BY bd.diagnosis_key, bp.procedure_key
+    ORDER BY encounter_count DESC
+    LIMIT 10
+) pairs
+JOIN dim_diagnosis dx ON dx.diagnosis_key = pairs.diagnosis_key
+JOIN dim_procedure px ON px.procedure_key = pairs.procedure_key
+ORDER BY pairs.encounter_count DESC;
+
+Performance:
+- Execution time: 1.379 s vs. 5.971 s original
+- Improvement: 4.3x faster
+- Rows read: ~2.80M vs. ~2.39M (slightly MORE)
+- Joins: 3 vs. 3; the 899,998-row pair explosion still happens
+
+Why it is faster (cheaper rows, not fewer rows):
+- Both bridges are read through covering indexes holding integers only;
+  the bridge PK clusters each encounter's procedures together.
+- Groups on two integer keys into a 1,102-row in-memory temp table,
+  instead of sorting 900K rows on four text columns.
+- COUNT(*) instead of COUNT(DISTINCT): the bridge PKs guarantee uniqueness.
+- ICD/CPT labels are joined to 10 rows instead of looked up 900K times.
+- Still the slowest query, as predicted in design_decisions.txt: a
+  pre-aggregated pairs table would be the next step if it ran often.
+
+
+---------------------------------------------------------------------------
+QUESTION 3: 30-Day Readmission Rate
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    s.specialty_name,
+    COUNT(*)                         AS inpatient_discharges,
+    SUM(f.readmitted_within_30_days) AS readmissions,
+    ROUND(100 * SUM(f.readmitted_within_30_days) / COUNT(*), 2) AS readmission_rate_pct
+FROM fact_encounters f
+JOIN dim_specialty      s ON s.specialty_key      = f.specialty_key
+JOIN dim_encounter_type t ON t.encounter_type_key = f.encounter_type_key
+WHERE t.is_inpatient = 1
+GROUP BY s.specialty_name
+ORDER BY readmission_rate_pct DESC;
+
+Performance:
+- Execution time: 0.032 s vs. 0.706 s original
+- Improvement: 21.9x faster
+- Rows read: ~72K vs. ~483K
+- Joins: 2 vs. 3 (the self-join is gone)
+
+Why it is faster:
+- No self-join: the readmission flag was computed once by the ETL, so the
+  query just SUMs a 0/1 column.
+- No full table scan: the covering index (specialty_key,
+  encounter_type_key, readmitted_within_30_days) jumps straight to the
+  35,931 inpatient rows and never reads the other 164K.
+- No COUNT(DISTINCT): one fact row = one stay. 1 temp table instead of 8.
+
+
+---------------------------------------------------------------------------
+QUESTION 4: Revenue by Specialty & Month
+---------------------------------------------------------------------------
+
+SQL Query:
+SELECT
+    d.year_month_label     AS service_month,
+    s.specialty_name,
+    SUM(daily.allowed)     AS total_allowed,
+    SUM(daily.claimed)     AS total_claimed,
+    SUM(daily.claims)      AS claims
+FROM (
+    SELECT encounter_date_key, specialty_key,
+           SUM(total_allowed_amount) AS allowed,
+           SUM(total_claim_amount)   AS claimed,
+           SUM(claim_count)          AS claims
+    FROM fact_encounters
+    WHERE claim_count > 0
+    GROUP BY encounter_date_key, specialty_key
+) daily
+JOIN dim_date      d ON d.date_key      = daily.encounter_date_key
+JOIN dim_specialty s ON s.specialty_key = daily.specialty_key
+GROUP BY d.year_month_label, s.specialty_name
+ORDER BY service_month, total_allowed DESC;
+
+Performance:
+- Execution time: 0.123 s vs. 1.544 s original
+- Improvement: 12.5x faster
+- Rows read: ~222K vs. ~780K
+- Joins: 2 vs. 3 (billing and providers are not joined at all)
+
+Why it is faster:
+- Billing amounts are pre-aggregated on the fact row: the 200K billing
+  lookups and the 3-hop chain to specialty disappear.
+- The amounts are part of the covering index, so the 200K rows are read
+  from the index alone (this index change took Q4 from ~0.54 s to 0.12 s).
+- Additive measures: rows are first summed per day x specialty (7,310
+  rows), then rolled up to months, so dim_date is joined 7,310 times
+  instead of 200K.
+- WHERE claim_count > 0 keeps only billed encounters, matching the OLTP
+  inner join to billing.
+
+
+---------------------------------------------------------------------------
+SUMMARY
+---------------------------------------------------------------------------
+
+Query  OLTP time  Star time  Speedup  Rows read (OLTP -> star)  Main reason
+Q1     0.736 s    0.276 s     2.7x    200K -> 209K              covering index, stored month label
+Q2     5.971 s    1.379 s     4.3x    2.39M -> 2.80M            integer bridges, labels after aggregation
+Q3     0.706 s    0.032 s    21.9x    483K -> 72K               readmission flag pre-computed (no self-join)
+Q4     1.544 s    0.123 s    12.5x    780K -> 222K              billing pre-aggregated, covering index
+
+The biggest gains come where the ETL removed work entirely (Q3's
+self-join, Q4's billing join). Where the work is inherent (Q1 counts every
+encounter, Q2 builds every pair), the star schema makes each row cheaper
+but cannot avoid touching it.
