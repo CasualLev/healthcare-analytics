@@ -4,7 +4,7 @@
 --
 -- Full refresh: empties every warehouse table and reloads it, so the
 -- script is rerunnable. The production incremental approach is described
--- in etl_design.txt.
+-- in docs/etl_design.txt.
 --
 -- Load order (parents before children, so every FK lookup succeeds):
 --   1. dim_date   2. other dimensions   3. fact_encounters   4. bridges

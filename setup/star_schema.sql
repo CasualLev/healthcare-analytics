@@ -2,7 +2,7 @@
 -- Healthcare Analytics Lab - Part 3.2: Star Schema DDL
 -- Database: healthcare_dw (analytics), loaded from healthcare_oltp (source)
 --
--- Design summary (see design_decisions.txt):
+-- Design summary (see docs/design_decisions.txt):
 --   Grain: fact_encounters has one row per encounter.
 --   8 dimensions with surrogate keys; key 0 = "Unknown" member (inserted by the ETL).
 --   2 bridge tables for the many-to-many diagnosis and procedure details.
