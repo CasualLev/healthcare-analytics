@@ -31,6 +31,7 @@ healthcare-analytics/
 │   ├── oltp_schema.sql          # creates healthcare_oltp (rerunnable)
 │   ├── oltp_sample_data.sql     # sample data from the brief
 │   ├── generated_data.sql       # deterministic volume data (200K encounters)
+│   ├── star_schema.sql          # star schema DDL (creates healthcare_dw)
 │   └── etl_load.sql             # loads healthcare_dw + reconciliation checks
 ├── queries/
 │   ├── oltp_queries.sql         # the 4 questions on the 3NF schema
@@ -40,7 +41,6 @@ healthcare-analytics/
 │   ├── design_decisions.txt     # Part 3.1: grain, dimensions, metrics, bridges
 │   ├── star_schema_queries.txt  # Part 3.3: optimized queries + speedups
 │   └── etl_design.txt           # Part 3.4: ETL logic and refresh strategy
-├── star_schema.sql              # star schema DDL (creates healthcare_dw)
 └── reflection.md                # Part 4: analysis, trade-offs, numbers
 ```
 
@@ -52,7 +52,7 @@ Run the scripts in this order, from MySQL Workbench or the command line:
 mysql -u root -p < setup/oltp_schema.sql
 mysql -u root -p < setup/oltp_sample_data.sql
 mysql -u root -p < setup/generated_data.sql
-mysql -u root -p < star_schema.sql
+mysql -u root -p < setup/star_schema.sql
 mysql -u root -p < setup/etl_load.sql          # ~45 s, ends with a check table (all rows should say OK)
 ```
 
